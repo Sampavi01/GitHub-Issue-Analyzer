@@ -1,8 +1,3 @@
-"""
-Categorizer Agent
-Classifies issues into categories based on keywords.
-"""
-
 CATEGORY_KEYWORDS = {
     "frontend": ["ui","frontend","css","html","react","vue","angular","button","layout"],
     "backend": ["backend","api","server","database","db","sql","query"],
@@ -20,5 +15,6 @@ def keyword_categorize(text: str):
             if k in text_l:
                 matches.append(cat)
                 break
-    if not matches: matches=["uncategorized"]
+    if not matches:
+        matches = ["uncategorized"]
     return matches
