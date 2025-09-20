@@ -1,67 +1,91 @@
-import os
+# backend.py
 import logging
 from fastapi import FastAPI
 from pydantic import BaseModel
+from typing import Dict, Optional
 
 from agents.ingestor import ingest_repo
 from agents.graph_builder import ensure_neo4j_constraints
-from agents.similarity import init_embedding_system, search_similar
-from agents.categorizer import keyword_categorize
-from agents.analytics import get_category_counts, get_top_contributors
+from agents.analyzer import categorize_issues, get_issue_types
+from agents.reporter import generate_report
 
-# -------------------------------
-# Setup
-# -------------------------------
+# Optionally init similarity if present
+try:
+    from agents.similarity import init_embedding_system
+except Exception:
+    def init_embedding_system():
+        return None
+
 app = FastAPI(title="SoftGraph Backend")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -------------------------------
-# Pydantic models
-# -------------------------------
 class IngestRequest(BaseModel):
     owner: str
     repo: str
     max_issues: int = 200
 
-class QueryRequest(BaseModel):
-    text: str
-    top_k: int = 5
+class RepoRequest(BaseModel):
+    owner: str
+    repo: str
 
-class CategorizeRequest(BaseModel):
-    text: str
+class WorkersInput(BaseModel):
+    owner: str
+    repo: str
+    workers_per_task: Dict[str, int]  # user fills counts per category
 
-# -------------------------------
-# Startup: initialize Neo4j + embeddings
-# -------------------------------
 @app.on_event("startup")
 def startup_event():
     ensure_neo4j_constraints()
     init_embedding_system()
 
-# -------------------------------
-# API endpoints
-# -------------------------------
 @app.post("/ingest_repo")
 def api_ingest_repo(req: IngestRequest):
     return ingest_repo(req.owner, req.repo, req.max_issues)
 
-@app.post("/query_similar")
-def api_query_similar(req: QueryRequest):
-    return search_similar(req.text, req.top_k)
+@app.post("/get_issue_types")
+def api_get_issue_types(req: RepoRequest):
+    """
+    Returns raw label counts + __unlabeled__ so UI can present labels to user.
+    """
+    types = get_issue_types(req.owner, req.repo)
+    return {"issue_types": types}
 
-@app.post("/categorize_issue")
-def api_categorize_issue(req: CategorizeRequest):
-    cats = keyword_categorize(req.text)
-    return {"categories": cats}
+@app.post("/get_issue_categories")
+def api_get_issue_categories(req: RepoRequest):
+    """
+    Returns semantic categories and small samples plus a worker-template:
+    {
+      "categories": {"UI Bug": {"count": 5, "samples": [...], "workers": None}, ... }
+    }
+    """
+    data = categorize_issues(req.owner, req.repo, include_samples=True, persist=False)
+    counts = data.get("counts", {})
+    samples = data.get("samples", {})
+    # build template for front-end / Swagger
+    template = {}
+    for cat, cnt in counts.items():
+        template[cat] = {"count": cnt, "samples": samples.get(cat, []), "workers": None}
+    return {"categories": template}
 
-@app.get("/analytics/category_counts")
-def api_category_counts():
-    return get_category_counts()
+@app.post("/submit_workers_and_report")
+def api_submit_workers_and_report(req: WorkersInput):
+    """
+    Endpoint the user calls after filling workers_per_task (in Swagger or UI).
+    Returns the final reporter output.
+    """
+    data = categorize_issues(req.owner, req.repo, include_samples=False, persist=False)
+    counts = data.get("counts", {})
+    report = generate_report(counts, req.workers_per_task)
+    return {"report": report}
 
-@app.get("/analytics/top_contributors")
-def api_top_contributors(limit: int = 10):
-    return get_top_contributors(limit)
+@app.post("/persist_categories")
+def api_persist_categories(req: RepoRequest):
+    """
+    OPTIONAL: classify all issues and store i.category in Neo4j for later use.
+    """
+    categorize_issues(req.owner, req.repo, include_samples=False, persist=True)
+    return {"status": "ok", "message": "categories persisted for repo"}
 
 @app.get("/health")
 def health_check():

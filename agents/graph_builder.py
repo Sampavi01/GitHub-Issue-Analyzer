@@ -1,13 +1,12 @@
+# agents/graph_builder.py
 from neo4j import GraphDatabase
-import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional, List
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
-logger = logging.getLogger(__name__)
-
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
@@ -34,13 +33,15 @@ def ensure_neo4j_constraints():
             except Exception:
                 pass
 
-def upsert_repo_node(owner: str, repo: str):
+def upsert_repo_node(owner: str, repo: str, readme: str = "", description: str = ""):
     driver = get_neo4j_driver()
     with driver.session() as session:
         full_name = f"{owner}/{repo}"
         session.run(
-            "MERGE (r:Repo {full_name:$full_name}) SET r.owner=$owner, r.name=$repo",
-            full_name=full_name, owner=owner, repo=repo
+            "MERGE (r:Repo {full_name:$full_name}) "
+            "SET r.owner=$owner, r.name=$repo, r.readme=$readme, r.description=$description",
+            full_name=full_name, owner=owner, repo=repo,
+            readme=readme, description=description
         )
 
 def upsert_developer_node(login: str, url: Optional[str] = None):
@@ -55,7 +56,15 @@ def upsert_issue_node(owner: str, repo: str, issue: Dict):
     driver = get_neo4j_driver()
     with driver.session() as session:
         issue_key = f"{owner}/{repo}#{issue['number']}"
-        labels = [lab['name'] for lab in issue.get('labels', [])]
+        labels_raw = issue.get('labels', []) or []
+        # labels in GitHub can be list of dicts or strings; normalize to list[str]
+        labels = []
+        for lab in labels_raw:
+            if isinstance(lab, dict) and 'name' in lab:
+                labels.append(lab['name'])
+            else:
+                labels.append(str(lab))
+
         session.run(
             "MERGE (i:Issue {id:$id}) "
             "SET i.number=$number, i.title=$title, i.body=$body, i.url=$url, "
@@ -65,15 +74,17 @@ def upsert_issue_node(owner: str, repo: str, issue: Dict):
             state=issue.get('state'), created_at=issue.get('created_at'),
             closed_at=issue.get('closed_at'), labels=labels
         )
+
         session.run(
             "MATCH (r:Repo {full_name:$full_name}), (i:Issue {id:$id}) "
             "MERGE (r)-[:HAS_ISSUE]->(i)",
             full_name=f"{owner}/{repo}", id=issue_key
         )
+
         if issue.get('user') and issue['user'].get('login'):
             session.run(
                 "MERGE (d:Developer {login:$login}) SET d.url=$url "
-                "WITH d MERGE (i:Issue {id:$id}) MERGE (d)-[:CREATED]->(i)",
+                "WITH d MATCH (i:Issue {id:$id}) MERGE (d)-[:CREATED]->(i)",
                 login=issue['user']['login'], url=issue['user'].get('html_url'), id=issue_key
             )
 
@@ -90,13 +101,14 @@ def upsert_pr_node(owner: str, repo: str, pr: Dict):
             state=pr.get('state'), created_at=pr.get('created_at'), merged_at=pr.get('merged_at')
         )
         session.run(
-            "MATCH (r:Repo {full_name:$full_name}), (p:PR {id:$id}) MERGE (r)-[:HAS_PR]->(p)",
+            "MATCH (r:Repo {full_name:$full_name}), (p:PR {id:$id}) "
+            "MERGE (r)-[:HAS_PR]->(p)",
             full_name=f"{owner}/{repo}", id=pr_key
         )
         if pr.get('user') and pr['user'].get('login'):
             session.run(
                 "MERGE (d:Developer {login:$login}) SET d.url=$url "
-                "WITH d MERGE (p:PR {id:$id}) MERGE (d)-[:AUTHORED]->(p)",
+                "WITH d MATCH (p:PR {id:$id}) MERGE (d)-[:AUTHORED]->(p)",
                 login=pr['user']['login'], url=pr['user'].get('html_url'), id=pr_key
             )
 
@@ -113,8 +125,18 @@ def link_prs_to_issues_by_closing_text(owner: str, repo: str, prs: List[Dict]):
                 issue_key = f"{owner}/{repo}#{int(m)}"
                 try:
                     session.run(
-                        "MATCH (p:PR {id:$prid}), (i:Issue {id:$iid}) MERGE (p)-[:RESOLVES]->(i)",
+                        "MATCH (p:PR {id:$prid}), (i:Issue {id:$iid}) "
+                        "MERGE (p)-[:RESOLVES]->(i)",
                         prid=pr_key, iid=issue_key
                     )
                 except Exception:
                     pass
+
+def set_issue_category(owner: str, repo: str, number: int, category: str):
+    driver = get_neo4j_driver()
+    with driver.session() as session:
+        issue_key = f"{owner}/{repo}#{number}"
+        session.run(
+            "MATCH (i:Issue {id:$id}) SET i.category=$category",
+            id=issue_key, category=category
+        )
