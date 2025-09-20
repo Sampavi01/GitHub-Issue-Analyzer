@@ -1,19 +1,9 @@
-"""
-Main FastAPI backend for Knowledge Graph + RAG system
-Features:
-- Ingest GitHub issues & PRs
-- Build Neo4j knowledge graph
-- Similarity search with embeddings + FAISS
-- Categorize issues by keywords
-- Analytics: top contributors, category counts
-"""
-
 import os
 import logging
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-from agents.ingestor import ingest_repo, fetch_issues, fetch_pull_requests
+from agents.ingestor import ingest_repo
 from agents.graph_builder import ensure_neo4j_constraints
 from agents.similarity import init_embedding_system, search_similar
 from agents.categorizer import keyword_categorize
@@ -75,7 +65,6 @@ def api_top_contributors(limit: int = 10):
 
 @app.get("/health")
 def health_check():
-    # Simple health check
     ok = True
     msgs = []
     try:
