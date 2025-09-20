@@ -1,91 +1,77 @@
-# backend.py
 import logging
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Dict, Optional
+from typing import Dict
 
 from agents.ingestor import ingest_repo
 from agents.graph_builder import ensure_neo4j_constraints
-from agents.analyzer import categorize_issues, get_issue_types
+from agents.analyzer import analyze_issues, get_last_ingested_repo
 from agents.reporter import generate_report
 
-# Optionally init similarity if present
-try:
-    from agents.similarity import init_embedding_system
-except Exception:
-    def init_embedding_system():
-        return None
-
+# -------------------------------
+# Setup
+# -------------------------------
 app = FastAPI(title="SoftGraph Backend")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# -------------------------------
+# Pydantic models
+# -------------------------------
 class IngestRequest(BaseModel):
     owner: str
     repo: str
     max_issues: int = 200
 
-class RepoRequest(BaseModel):
-    owner: str
-    repo: str
+class TaskInputRequest(BaseModel):
+    workers_per_task: Dict[str, int]  # user fills in number of employees per main issue type
 
-class WorkersInput(BaseModel):
-    owner: str
-    repo: str
-    workers_per_task: Dict[str, int]  # user fills counts per category
-
+# -------------------------------
+# Startup: initialize Neo4j
+# -------------------------------
 @app.on_event("startup")
 def startup_event():
     ensure_neo4j_constraints()
-    init_embedding_system()
 
+# -------------------------------
+# API endpoints
+# -------------------------------
 @app.post("/ingest_repo")
 def api_ingest_repo(req: IngestRequest):
+    """
+    Ingest repo metadata, README, issues, labels, and PRs.
+    """
     return ingest_repo(req.owner, req.repo, req.max_issues)
 
-@app.post("/get_issue_types")
-def api_get_issue_types(req: RepoRequest):
+@app.get("/analyze_issues")
+def api_analyze_issues():
     """
-    Returns raw label counts + __unlabeled__ so UI can present labels to user.
+    Display issue categories (subtypes) to user before worker allocation.
     """
-    types = get_issue_types(req.owner, req.repo)
-    return {"issue_types": types}
+    repo_info = get_last_ingested_repo()
+    if not repo_info:
+        return {"error": "No repo ingested yet. Please ingest a repo first."}
 
-@app.post("/get_issue_categories")
-def api_get_issue_categories(req: RepoRequest):
-    """
-    Returns semantic categories and small samples plus a worker-template:
-    {
-      "categories": {"UI Bug": {"count": 5, "samples": [...], "workers": None}, ... }
-    }
-    """
-    data = categorize_issues(req.owner, req.repo, include_samples=True, persist=False)
-    counts = data.get("counts", {})
-    samples = data.get("samples", {})
-    # build template for front-end / Swagger
-    template = {}
-    for cat, cnt in counts.items():
-        template[cat] = {"count": cnt, "samples": samples.get(cat, []), "workers": None}
-    return {"categories": template}
+    owner, repo = repo_info["owner"], repo_info["repo"]
+    issue_categories = analyze_issues(owner, repo)  # category -> count
+    return {"repo": f"{owner}/{repo}", "issue_categories": issue_categories}
 
-@app.post("/submit_workers_and_report")
-def api_submit_workers_and_report(req: WorkersInput):
+@app.post("/generate_report")
+def api_generate_report(req: TaskInputRequest):
     """
-    Endpoint the user calls after filling workers_per_task (in Swagger or UI).
-    Returns the final reporter output.
+    Generate report using previously analyzed issue categories and user input
+    for workers per main issue type.
     """
-    data = categorize_issues(req.owner, req.repo, include_samples=False, persist=False)
-    counts = data.get("counts", {})
-    report = generate_report(counts, req.workers_per_task)
-    return {"report": report}
+    repo_info = get_last_ingested_repo()
+    if not repo_info:
+        return {"error": "No repo ingested yet. Please ingest a repo first."}
 
-@app.post("/persist_categories")
-def api_persist_categories(req: RepoRequest):
-    """
-    OPTIONAL: classify all issues and store i.category in Neo4j for later use.
-    """
-    categorize_issues(req.owner, req.repo, include_samples=False, persist=True)
-    return {"status": "ok", "message": "categories persisted for repo"}
+    owner, repo = repo_info["owner"], repo_info["repo"]
+    issue_categories = analyze_issues(owner, repo)  # get subtypes
+
+    # Generate recommendation report based on user input
+    report = generate_report(issue_categories, req.workers_per_task)
+    return {"report": report, "issue_categories": issue_categories}
 
 @app.get("/health")
 def health_check():

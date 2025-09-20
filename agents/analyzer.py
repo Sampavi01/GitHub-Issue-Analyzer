@@ -1,115 +1,63 @@
-# agents/analyzer.py
+from agents.graph_builder import get_neo4j_driver
 from collections import defaultdict
-from typing import Optional, Dict, List, Any
-from agents.graph_builder import get_neo4j_driver, set_issue_category
+from typing import Dict, Optional
 
-def categorize_issue(title: str, body: str, labels: Optional[List[str]]) -> str:
-    text = f"{(title or '')} {(body or '')}".lower()
-    labels = [l.lower() for l in (labels or [])]
+# Define bug subtypes based on keywords
+BUG_KEYWORDS = {
+    "UI": ["ui", "button", "layout", "screen", "css"],
+    "Performance": ["slow", "lag", "performance", "memory"],
+    "Security": ["vulnerable", "security", "auth", "permission"],
+    "Crash": ["crash", "exception", "error", "fail"],
+}
 
-    if any(l in labels for l in ("bug", "bugs")):
-        if any(k in text for k in ("ui", "button", "screen", "layout", "css", "ux", "render")):
-            return "UI Bug"
-        if any(k in text for k in ("crash", "exception", "segfault", "traceback", "error")):
-            return "Crash Bug"
-        if any(k in text for k in ("slow", "performance", "latency", "lag", "timeout", "memory")):
-            return "Performance Bug"
-        if any(k in text for k in ("auth", "login", "token", "permission", "access")):
-            return "Auth Bug"
-        return "Other Bug"
-
-    if any(l in labels for l in ("enhancement", "feature", "proposal")):
-        if any(k in text for k in ("api", "backend", "server", "db", "database")):
-            return "Backend Feature"
-        if any(k in text for k in ("ui", "ux", "layout", "design")):
-            return "UI Feature"
-        return "General Feature"
-
-    if any(l in labels for l in ("doc", "docs", "documentation", "readme")):
-        return "Documentation"
-
-    # fallback: detect from text
-    if any(k in text for k in ("documentation", "readme", "docs")):
-        return "Documentation"
-    if any(k in text for k in ("feature request", "feature:", "enhancement")):
-        return "Feature Request"
-    if any(k in text for k in ("error", "exception", "fix", "bug", "crash")):
-        return "Other Bug"
-
-    return "Uncategorized"
-
-def categorize_issues(owner: str, repo: str, include_samples: bool = True, persist: bool = False) -> Dict[str, Any]:
-    driver = get_neo4j_driver()
-    counts = defaultdict(int)
-    samples = defaultdict(list)
-
-    full_name = f"{owner}/{repo}"
-    query = """
-    MATCH (r:Repo {full_name:$full_name})-[:HAS_ISSUE]->(i:Issue)
-    RETURN i.number AS number, i.title AS title, i.body AS body, i.labels AS labels
+def analyze_issues(owner: str, repo: str) -> Dict[str, int]:
     """
-
-    with driver.session() as session:
-        results = session.run(query, full_name=full_name)
-        for record in results:
-            title = record.get("title") or ""
-            body = record.get("body") or ""
-            labels = record.get("labels") or []
-            number = record.get("number")
-            cat = categorize_issue(title, body, labels)
-            counts[cat] += 1
-            if include_samples and len(samples[cat]) < 3:
-                samples[cat].append({"number": number, "title": title})
-            if persist:
-                try:
-                    set_issue_category(owner, repo, number, cat)
-                except Exception:
-                    pass
-
-    return {"counts": dict(counts), "samples": dict(samples)}
-
-def get_issue_types(owner: Optional[str] = None, repo: Optional[str] = None) -> Dict[str, int]:
+    Categorize issues into detailed types/subtypes using labels + title/body.
+    Returns a dict: category -> count
+    """
     driver = get_neo4j_driver()
-    if owner and repo:
-        full_name = f"{owner}/{repo}"
-        label_query = """
-        MATCH (r:Repo {full_name:$full_name})-[:HAS_ISSUE]->(i:Issue)
-        UNWIND (CASE WHEN i.labels IS NULL THEN [] ELSE i.labels END) AS label
-        RETURN label, count(*) AS cnt
-        """
-        unlabeled_query = """
-        MATCH (r:Repo {full_name:$full_name})-[:HAS_ISSUE]->(i:Issue)
-        WHERE i.labels IS NULL OR size(i.labels)=0
-        RETURN count(i) AS cnt
-        """
-        params = {"full_name": full_name}
-    else:
-        label_query = """
-        MATCH (i:Issue)
-        UNWIND (CASE WHEN i.labels IS NULL THEN [] ELSE i.labels END) AS label
-        RETURN label, count(*) AS cnt
-        """
-        unlabeled_query = """
-        MATCH (i:Issue)
-        WHERE i.labels IS NULL OR size(i.labels)=0
-        RETURN count(i) AS cnt
-        """
-        params = {}
+    issue_counts = defaultdict(int)
 
-    counts: Dict[str, int] = {}
     with driver.session() as session:
-        res = session.run(label_query, **params)
-        for r in res:
-            lbl = r["label"]
-            cnt = r["cnt"]
-            if lbl is None:
-                continue
-            counts[str(lbl)] = int(cnt)
-        res2 = session.run(unlabeled_query, **params)
-        unlabeled_cnt = 0
-        row = res2.single()
-        if row:
-            unlabeled_cnt = int(row["cnt"] or 0)
-        counts["__unlabeled__"] = unlabeled_cnt
+        query = """
+        MATCH (i:Issue)<-[:HAS_ISSUE]-(r:Repo {full_name:$full_name})
+        RETURN i.title AS title, i.body AS body, i.labels AS labels
+        """
+        results = session.run(query, full_name=f"{owner}/{repo}")
 
-    return counts
+        for record in results:
+            title = record["title"] or ""
+            body = record["body"] or ""
+            labels = record["labels"] or []
+
+            main_type = labels[0] if labels else "Other"
+            sub_type = "General"
+
+            if main_type.lower() == "bug":
+                text = (title + " " + body).lower()
+                for k, keywords in BUG_KEYWORDS.items():
+                    if any(word in text for word in keywords):
+                        sub_type = k
+                        break
+
+            category = f"{main_type} - {sub_type}"
+            issue_counts[category] += 1
+
+    return dict(issue_counts)
+
+def get_last_ingested_repo() -> Optional[Dict[str, str]]:
+    """
+    Returns the last ingested repo from Neo4j to avoid asking repo repeatedly.
+    """
+    driver = get_neo4j_driver()
+    with driver.session() as session:
+        query = """
+        MATCH (r:Repo) 
+        RETURN r.owner AS owner, r.name AS repo 
+        ORDER BY r.full_name DESC LIMIT 1
+        """
+        result = session.run(query)
+        record = result.single()
+        if record:
+            return {"owner": record["owner"], "repo": record["repo"]}
+    return None
