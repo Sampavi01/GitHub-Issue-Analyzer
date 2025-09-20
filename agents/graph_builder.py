@@ -1,35 +1,25 @@
-"""
-Graph Builder Agent
-Handles all Neo4j interactions: creating nodes, relationships, and constraints.
-"""
-
 from neo4j import GraphDatabase
 import logging
 from typing import Dict, List, Optional
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-import os
-
-# Neo4j credentials
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 neo4j_driver = None
 
-# -------------------------------
-# Neo4j connection
-# -------------------------------
 def get_neo4j_driver():
-    """Initialize or return Neo4j driver."""
     global neo4j_driver
     if neo4j_driver is None:
         neo4j_driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
     return neo4j_driver
 
 def ensure_neo4j_constraints():
-    """Create unique constraints for nodes."""
     driver = get_neo4j_driver()
     with driver.session() as session:
         queries = [
@@ -44,9 +34,6 @@ def ensure_neo4j_constraints():
             except Exception:
                 pass
 
-# -------------------------------
-# Node upserts
-# -------------------------------
 def upsert_repo_node(owner: str, repo: str):
     driver = get_neo4j_driver()
     with driver.session() as session:
@@ -65,9 +52,6 @@ def upsert_developer_node(login: str, url: Optional[str] = None):
         )
 
 def upsert_issue_node(owner: str, repo: str, issue: Dict):
-    """
-    Insert or update an issue node in Neo4j, link to repo & author.
-    """
     driver = get_neo4j_driver()
     with driver.session() as session:
         issue_key = f"{owner}/{repo}#{issue['number']}"
@@ -81,13 +65,11 @@ def upsert_issue_node(owner: str, repo: str, issue: Dict):
             state=issue.get('state'), created_at=issue.get('created_at'),
             closed_at=issue.get('closed_at'), labels=labels
         )
-        # Link to repo
         session.run(
             "MATCH (r:Repo {full_name:$full_name}), (i:Issue {id:$id}) "
             "MERGE (r)-[:HAS_ISSUE]->(i)",
             full_name=f"{owner}/{repo}", id=issue_key
         )
-        # Link to author
         if issue.get('user') and issue['user'].get('login'):
             session.run(
                 "MERGE (d:Developer {login:$login}) SET d.url=$url "
@@ -96,7 +78,6 @@ def upsert_issue_node(owner: str, repo: str, issue: Dict):
             )
 
 def upsert_pr_node(owner: str, repo: str, pr: Dict):
-    """Insert PR node and link to repo & author."""
     driver = get_neo4j_driver()
     with driver.session() as session:
         pr_key = f"{owner}/{repo}#PR{pr['number']}"
@@ -108,12 +89,10 @@ def upsert_pr_node(owner: str, repo: str, pr: Dict):
             body=pr.get('body') or "", url=pr.get('html_url'),
             state=pr.get('state'), created_at=pr.get('created_at'), merged_at=pr.get('merged_at')
         )
-        # Link to repo
         session.run(
             "MATCH (r:Repo {full_name:$full_name}), (p:PR {id:$id}) MERGE (r)-[:HAS_PR]->(p)",
             full_name=f"{owner}/{repo}", id=pr_key
         )
-        # Link to author
         if pr.get('user') and pr['user'].get('login'):
             session.run(
                 "MERGE (d:Developer {login:$login}) SET d.url=$url "
@@ -122,9 +101,6 @@ def upsert_pr_node(owner: str, repo: str, pr: Dict):
             )
 
 def link_prs_to_issues_by_closing_text(owner: str, repo: str, prs: List[Dict]):
-    """
-    Scan PR title/body for "fixes #123" style references to link PR -> Issue.
-    """
     import re
     pattern = re.compile(r"(?:close[sd]?|fixe[sd]?|resolve[sd]?)\s+#(\d+)", re.IGNORECASE)
     driver = get_neo4j_driver()
